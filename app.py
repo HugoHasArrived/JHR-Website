@@ -17,8 +17,8 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.environ.get("JHR_DATABASE", os.path.join(BASE_DIR, "jhr.db"))
-STAFF_USERNAME = os.environ.get("STAFF_USERNAME", "staff")
-STAFF_PASSWORD = os.environ.get("STAFF_PASSWORD", "change-me-now")
+STAFF_USERNAME = os.environ.get("STAFF_USERNAME", "admin")
+STAFF_PASSWORD = os.environ.get("STAFF_PASSWORD", "ChangeMe123!")
 MAX_IMAGE_MB = 10
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
 
