@@ -1,8 +1,94 @@
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request, redirect, url_for, session, abort, send_file, flash
 import webbrowser
 import threading
+import sqlite3
+import os
+import secrets
+from io import BytesIO
+from datetime import datetime
+
 
 app = Flask(__name__)
+
+# ============================================================
+# JHR CONTENT STORAGE
+# ============================================================
+
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE = os.environ.get("JHR_DATABASE", os.path.join(BASE_DIR, "jhr.db"))
+STAFF_USERNAME = os.environ.get("STAFF_USERNAME", "staff")
+STAFF_PASSWORD = os.environ.get("STAFF_PASSWORD", "change-me-now")
+MAX_IMAGE_MB = 10
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
+
+
+def get_db():
+    db = sqlite3.connect(DATABASE)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def init_db():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            section TEXT NOT NULL CHECK(section IN ('gallery','news','announcement')),
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            image_data BLOB,
+            image_mime TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def staff_required():
+    return session.get("staff_logged_in") is True
+
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def read_uploaded_image(required=False):
+    image = request.files.get("image")
+    if not image or not image.filename:
+        if required:
+            raise ValueError("Please select an image.")
+        return None, None
+
+    if not allowed_file(image.filename):
+        raise ValueError("Only PNG, JPG, JPEG, GIF and WEBP images are allowed.")
+
+    data = image.read()
+    if not data:
+        raise ValueError("The selected image is empty.")
+
+    if len(data) > MAX_IMAGE_MB * 1024 * 1024:
+        raise ValueError(f"Image must be smaller than {MAX_IMAGE_MB} MB.")
+
+    mime = image.mimetype or "application/octet-stream"
+    if mime not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+        raise ValueError("Invalid image type.")
+
+    return data, mime
+
+
+def get_posts(section):
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, section, title, description, image_mime, created_at FROM posts WHERE section=? ORDER BY id DESC",
+        (section,)
+    ).fetchall()
+    db.close()
+    return rows
+
+
+init_db()
 
 HTML = r"""
 <!DOCTYPE html>
@@ -596,6 +682,70 @@ body.dark .logo img {
 }
 
 /* =========================
+   JHR POSTS / GALLERY / NEWS
+========================= */
+
+.post-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 25px;
+}
+
+.post-card {
+    background: var(--card);
+    border-radius: 25px;
+    overflow: hidden;
+    box-shadow: 0 12px 35px rgba(60,20,90,.14);
+    border-top: 5px solid var(--purple);
+    transition: .3s;
+}
+
+.post-card:hover {
+    transform: translateY(-7px);
+}
+
+.post-image {
+    width: 100%;
+    height: 260px;
+    object-fit: cover;
+    display: block;
+    background: #eee;
+}
+
+.post-no-image {
+    height: 260px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 60px;
+    background: linear-gradient(135deg,#ead7ff,#d9faff);
+}
+
+.post-body {
+    padding: 25px;
+}
+
+.post-body h3 {
+    color: var(--purple);
+    margin-bottom: 7px;
+    font-size: 25px;
+}
+
+.post-date {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 12px;
+}
+
+.empty-posts {
+    text-align: center;
+    padding: 30px;
+    background: var(--card);
+    border-radius: 20px;
+    color: var(--muted);
+}
+
+/* =========================
    GAMES
 ========================= */
 
@@ -878,8 +1028,12 @@ alt="JHR Logo"
 <a href="#projects">Projects</a>
 <a href="#experience">Experience</a>
 <a href="#owners">Owners</a>
+<a href="#gallery">Gallery</a>
+<a href="#news">News</a>
+<a href="#announcements">Announcements</a>
 <a href="#games">Games</a>
 <a href="#contact">Contact</a>
+<a href="{{ url_for('staff_login') }}">Staff</a>
 
 <button
 class="language-button"
@@ -1339,6 +1493,105 @@ The co-founder supports JHR's projects, creativity and technology activities. To
 </div>
 
 </div>
+
+</section>
+
+
+<!-- =========================
+     GALLERY
+========================= -->
+
+<section class="section" id="gallery">
+
+<h2 class="title">JHR Gallery 📸</h2>
+<p class="subtitle">Photos and memories from JHR.</p>
+
+{% if gallery %}
+<div class="post-grid">
+{% for post in gallery %}
+<article class="post-card">
+{% if post["image_mime"] %}
+<img class="post-image" src="{{ url_for('post_image', post_id=post['id']) }}" alt="{{ post['title'] }}">
+{% else %}
+<div class="post-no-image">📷</div>
+{% endif %}
+<div class="post-body">
+<h3>{{ post["title"] }}</h3>
+<div class="post-date">{{ post["created_at"] }}</div>
+<p>{{ post["description"] }}</p>
+</div>
+</article>
+{% endfor %}
+</div>
+{% else %}
+<div class="empty-posts">No gallery photos have been posted yet.</div>
+{% endif %}
+
+</section>
+
+
+<!-- =========================
+     NEWS
+========================= -->
+
+<section class="section" id="news">
+
+<h2 class="title">JHR News 📰</h2>
+<p class="subtitle">Latest JHR news and updates.</p>
+
+{% if news %}
+<div class="post-grid">
+{% for post in news %}
+<article class="post-card">
+{% if post["image_mime"] %}
+<img class="post-image" src="{{ url_for('post_image', post_id=post['id']) }}" alt="{{ post['title'] }}">
+{% else %}
+<div class="post-no-image">📰</div>
+{% endif %}
+<div class="post-body">
+<h3>{{ post["title"] }}</h3>
+<div class="post-date">{{ post["created_at"] }}</div>
+<p>{{ post["description"] }}</p>
+</div>
+</article>
+{% endfor %}
+</div>
+{% else %}
+<div class="empty-posts">No news has been posted yet.</div>
+{% endif %}
+
+</section>
+
+
+<!-- =========================
+     ANNOUNCEMENTS
+========================= -->
+
+<section class="section" id="announcements">
+
+<h2 class="title">Announcements 📢</h2>
+<p class="subtitle">Important JHR announcements.</p>
+
+{% if announcements %}
+<div class="post-grid">
+{% for post in announcements %}
+<article class="post-card">
+{% if post["image_mime"] %}
+<img class="post-image" src="{{ url_for('post_image', post_id=post['id']) }}" alt="{{ post['title'] }}">
+{% else %}
+<div class="post-no-image">📢</div>
+{% endif %}
+<div class="post-body">
+<h3>{{ post["title"] }}</h3>
+<div class="post-date">{{ post["created_at"] }}</div>
+<p>{{ post["description"] }}</p>
+</div>
+</article>
+{% endfor %}
+</div>
+{% else %}
+<div class="empty-posts">No announcements have been posted yet.</div>
+{% endif %}
 
 </section>
 
@@ -1942,7 +2195,184 @@ function toggleMusic() {
 
 @app.route("/")
 def home():
-    return render_template_string(HTML)
+    return render_template_string(
+        HTML,
+        gallery=get_posts("gallery"),
+        news=get_posts("news"),
+        announcements=get_posts("announcement")
+    )
+
+
+@app.route("/image/<int:post_id>")
+def post_image(post_id):
+    db = get_db()
+    post = db.execute(
+        "SELECT image_data, image_mime FROM posts WHERE id=?",
+        (post_id,)
+    ).fetchone()
+    db.close()
+
+    if not post or not post["image_data"]:
+        abort(404)
+
+    return send_file(
+        BytesIO(post["image_data"]),
+        mimetype=post["image_mime"],
+        max_age=0
+    )
+
+
+@app.route("/staff/login", methods=["GET", "POST"])
+def staff_login():
+    if staff_required():
+        return redirect(url_for("staff_dashboard"))
+
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+
+        if (secrets.compare_digest(username, STAFF_USERNAME) and
+                secrets.compare_digest(password, STAFF_PASSWORD)):
+            session.clear()
+            session["staff_logged_in"] = True
+            return redirect(url_for("staff_dashboard"))
+
+        flash("Incorrect username or password.")
+
+    return render_template_string(STAFF_LOGIN_HTML)
+
+
+@app.route("/staff/logout")
+def staff_logout():
+    session.clear()
+    return redirect(url_for("home"))
+
+
+@app.route("/staff")
+def staff_dashboard():
+    if not staff_required():
+        return redirect(url_for("staff_login"))
+
+    return render_template_string(
+        STAFF_DASHBOARD_HTML,
+        gallery=get_posts("gallery"),
+        news=get_posts("news"),
+        announcements=get_posts("announcement")
+    )
+
+
+@app.route("/staff/add/<section>", methods=["POST"])
+def add_post(section):
+    if not staff_required():
+        return redirect(url_for("staff_login"))
+
+    if section not in {"gallery", "news", "announcement"}:
+        abort(404)
+
+    title = request.form.get("title", "").strip()
+    description = request.form.get("description", "").strip()
+
+    if not title:
+        flash("Title is required.")
+        return redirect(url_for("staff_dashboard"))
+
+    if not description:
+        flash("Description is required.")
+        return redirect(url_for("staff_dashboard"))
+
+    try:
+        image_data, image_mime = read_uploaded_image(required=(section == "gallery"))
+    except ValueError as exc:
+        flash(str(exc))
+        return redirect(url_for("staff_dashboard"))
+
+    db = get_db()
+    db.execute("""
+        INSERT INTO posts
+        (section, title, description, image_data, image_mime, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        section,
+        title,
+        description,
+        image_data,
+        image_mime,
+        datetime.now().strftime("%B %d, %Y %I:%M %p")
+    ))
+    db.commit()
+    db.close()
+
+    flash("Post published successfully.")
+    return redirect(url_for("staff_dashboard"))
+
+
+@app.route("/staff/delete/<int:post_id>", methods=["POST"])
+def delete_post(post_id):
+    if not staff_required():
+        return redirect(url_for("staff_login"))
+
+    db = get_db()
+    db.execute("DELETE FROM posts WHERE id=?", (post_id,))
+    db.commit()
+    db.close()
+
+    flash("Post deleted.")
+    return redirect(url_for("staff_dashboard"))
+
+
+STAFF_LOGIN_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JHR Staff Login</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:Arial;background:linear-gradient(135deg,#26083f,#7628d9,#ff4fcf)}
+.box{width:min(420px,90%);background:#fff;padding:35px;border-radius:25px;box-shadow:0 20px 60px #0005}
+h1{color:#7628d9} input,button{width:100%;padding:13px;margin:8px 0;box-sizing:border-box;border-radius:10px;border:1px solid #ddd} button{border:0;color:#fff;background:linear-gradient(135deg,#7628d9,#ff4fcf);font-weight:bold;cursor:pointer}.error{padding:10px;background:#ffe8ed;color:#a00;border-radius:10px}a{color:#7628d9}
+</style>
+</head>
+<body><div class="box"><h1>JHR Staff</h1><p>Manage Gallery, News and Announcements.</p>
+{% with messages=get_flashed_messages() %}{% for message in messages %}<div class="error">{{ message }}</div>{% endfor %}{% endwith %}
+<form method="POST"><input name="username" placeholder="Username" required><input name="password" type="password" placeholder="Password" required><button>Sign In</button></form>
+<p><a href="{{ url_for('home') }}">← Back to website</a></p></div></body></html>
+"""
+
+
+STAFF_DASHBOARD_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JHR Staff Dashboard</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Arial;background:#f7f1ff;color:#261533}header{padding:25px 5%;color:#fff;background:linear-gradient(135deg,#26083f,#7628d9,#ff4fcf)}header a{color:#fff;text-decoration:none;margin-right:20px}main{max-width:1200px;margin:auto;padding:30px 20px}.panel{background:#fff;border-radius:22px;padding:25px;margin-bottom:25px;box-shadow:0 10px 30px #3c145c1f}.tabs{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:25px}.tabs a{padding:11px 17px;background:#7628d9;color:#fff;text-decoration:none;border-radius:20px}input,textarea{width:100%;padding:12px;border:1px solid #ddd;border-radius:10px;margin:6px 0 14px;font:inherit}textarea{min-height:120px;resize:vertical}button{padding:11px 18px;border:0;border-radius:20px;background:#7628d9;color:#fff;font-weight:bold;cursor:pointer}.delete{background:#c62828}.post{display:grid;grid-template-columns:180px 1fr auto;gap:20px;align-items:center;border-top:1px solid #eee;padding:18px 0}.post img{width:180px;height:120px;object-fit:cover;border-radius:12px}.post h3{color:#7628d9;margin:0}.muted{color:#777}.flash{padding:12px;background:#e8fff0;color:#146b35;border-radius:10px;margin-bottom:15px}@media(max-width:700px){.post{grid-template-columns:1fr}.post img{width:100%;height:220px}}
+</style>
+</head>
+<body>
+<header><h1>JHR Staff Dashboard</h1><p>Upload and manage website content.</p><a href="{{ url_for('home') }}">View Website</a><a href="{{ url_for('staff_logout') }}">Logout</a></header>
+<main>
+{% with messages=get_flashed_messages() %}{% for message in messages %}<div class="flash">{{ message }}</div>{% endfor %}{% endwith %}
+<div class="tabs"><a href="#gallery">📸 Gallery</a><a href="#news">📰 News</a><a href="#announcements">📢 Announcements</a></div>
+
+<section class="panel" id="gallery"><h2>📸 Gallery</h2><p>Gallery requires an image, title and description.</p>
+<form method="POST" action="{{ url_for('add_post', section='gallery') }}" enctype="multipart/form-data"><label>Title</label><input name="title" maxlength="200" required><label>Description</label><textarea name="description" maxlength="5000" required></textarea><label>Photo</label><input type="file" name="image" accept="image/png,image/jpeg,image/gif,image/webp" required><button>Upload Gallery Photo</button></form>
+{% for post in gallery %}<div class="post">{% if post['image_mime'] %}<img src="{{ url_for('post_image',post_id=post['id']) }}" alt="{{ post['title'] }}">{% endif %}<div><h3>{{ post['title'] }}</h3><p class="muted">{{ post['created_at'] }}</p><p>{{ post['description'] }}</p></div><form method="POST" action="{{ url_for('delete_post',post_id=post['id']) }}"><button class="delete" onclick="return confirm('Delete this post?')">Delete</button></form></div>{% else %}<p class="muted">No gallery posts yet.</p>{% endfor %}
+</section>
+
+<section class="panel" id="news"><h2>📰 News</h2>
+<form method="POST" action="{{ url_for('add_post', section='news') }}" enctype="multipart/form-data"><label>Title</label><input name="title" maxlength="200" required><label>Description</label><textarea name="description" maxlength="5000" required></textarea><label>Photo (optional)</label><input type="file" name="image" accept="image/png,image/jpeg,image/gif,image/webp"><button>Publish News</button></form>
+{% for post in news %}<div class="post">{% if post['image_mime'] %}<img src="{{ url_for('post_image',post_id=post['id']) }}" alt="{{ post['title'] }}">{% endif %}<div><h3>{{ post['title'] }}</h3><p class="muted">{{ post['created_at'] }}</p><p>{{ post['description'] }}</p></div><form method="POST" action="{{ url_for('delete_post',post_id=post['id']) }}"><button class="delete" onclick="return confirm('Delete this post?')">Delete</button></form></div>{% else %}<p class="muted">No news posts yet.</p>{% endfor %}
+</section>
+
+<section class="panel" id="announcements"><h2>📢 Announcements</h2>
+<form method="POST" action="{{ url_for('add_post', section='announcement') }}" enctype="multipart/form-data"><label>Title</label><input name="title" maxlength="200" required><label>Description</label><textarea name="description" maxlength="5000" required></textarea><label>Photo (optional)</label><input type="file" name="image" accept="image/png,image/jpeg,image/gif,image/webp"><button>Publish Announcement</button></form>
+{% for post in announcements %}<div class="post">{% if post['image_mime'] %}<img src="{{ url_for('post_image',post_id=post['id']) }}" alt="{{ post['title'] }}">{% endif %}<div><h3>{{ post['title'] }}</h3><p class="muted">{{ post['created_at'] }}</p><p>{{ post['description'] }}</p></div><form method="POST" action="{{ url_for('delete_post',post_id=post['id']) }}"><button class="delete" onclick="return confirm('Delete this post?')">Delete</button></form></div>{% else %}<p class="muted">No announcements yet.</p>{% endfor %}
+</section>
+</main></body></html>
+"""
 
 
 def open_browser():
@@ -1971,7 +2401,7 @@ if __name__ == "__main__":
     ).start()
 
     app.run(
-        host="127.0.0.1",
-        port=5000,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
         debug=False
     )
